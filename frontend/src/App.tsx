@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { VeyGlassProvider, VeyModal, VeyTabs, VeyToast } from "@veydeck/react";
 import { packetApi, toApiUrl } from "./api";
 import { BuilderPanel } from "./components/BuilderPanel";
@@ -390,6 +390,10 @@ export default function App() {
   const [pcaps, setPcaps] = useState<PcapFile[]>([]);
   const [loadingPcaps, setLoadingPcaps] = useState(false);
   const [pcapListError, setPcapListError] = useState<string | null>(null);
+  // 主控导入入口只在首次成功加载列表时消费，后续刷新保留用户选择。
+  const pendingImportedPcap = useRef(
+    new URLSearchParams(window.location.search).get("pcapId"),
+  );
   const [selectedPcap, setSelectedPcap] = useState<PcapFile | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -452,10 +456,20 @@ export default function App() {
       const data = await packetApi.listPcaps();
       setPcaps(data);
       setPcapListError(null);
-      setSelectedPcap((current) => {
-        if (!current) return current;
-        return data.find((pcap) => pcap.id === current.id) ?? null;
-      });
+      const importedPcap = data.find(
+        (pcap) => pcap.id === pendingImportedPcap.current,
+      );
+      if (importedPcap) {
+        pendingImportedPcap.current = null;
+        setSelectedPcap(importedPcap);
+        setActiveTab("pcaps");
+        setPage(1);
+      } else {
+        setSelectedPcap((current) => {
+          if (!current) return current;
+          return data.find((pcap) => pcap.id === current.id) ?? null;
+        });
+      }
     } catch (error) {
       setPcapListError((error as Error).message);
     } finally {
