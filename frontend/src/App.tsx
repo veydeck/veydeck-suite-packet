@@ -169,6 +169,7 @@ const layerNameMap: Record<string, string> = {
   DNS: "DNS",
   "DNS Question Record": "DNSQR",
   Raw: "Raw",
+  Padding: "Padding",
 };
 
 const allowedFields: Record<string, string[]> = {
@@ -183,6 +184,7 @@ const allowedFields: Record<string, string[]> = {
   DNS: ["id", "qr", "rd"],
   DNSQR: ["qname", "qtype"],
   Raw: ["load"],
+  Padding: ["load"],
 };
 
 const arpOpAliases: Record<string, string> = {
@@ -350,7 +352,14 @@ function mapDetailToBuilderLayers(detail: PacketDetail): {
   if (!hasRawPayload) {
     const payload = extractTransportPayload(detail);
     if (payload) {
-      mapped.push({ name: "Raw", fields: { load: payload } });
+      // 业务负载必须位于尾部填充之前，不能改变填充的链路层语义。
+      const paddingIndex = mapped.findIndex(
+        (layer) => layer.name === "Padding",
+      );
+      mapped.splice(paddingIndex < 0 ? mapped.length : paddingIndex, 0, {
+        name: "Raw",
+        fields: { load: payload },
+      });
     }
   }
 

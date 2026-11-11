@@ -4,7 +4,7 @@ from scapy.layers.l2 import ARP, Dot1Q, Ether
 from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.layers.inet6 import IPv6
 from scapy.layers.dns import DNS, DNSQR
-from scapy.packet import Raw
+from scapy.packet import Padding, Raw
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,7 @@ LAYER_MAP = {
     "DNS": DNS,
     "DNSQR": DNSQR,
     "Raw": Raw,
+    "Padding": Padding,
 }
 
 # 字段白名单以及其期望的数据类型转换函数
@@ -92,6 +93,7 @@ ALLOWED_FIELDS = {
         "qclass": str,
     },
     "Raw": {"load": str},
+    "Padding": {"load": str},
 }
 
 BUILDER_SCHEMA = {
@@ -411,6 +413,18 @@ BUILDER_SCHEMA = {
                 },
             ],
         },
+        {
+            "name": "Padding",
+            "label": "Frame Padding",
+            "fields": [
+                {
+                    "key": "load",
+                    "label": "load",
+                    "placeholder": r"\x00\x00",
+                    "wide": True,
+                },
+            ],
+        },
     ]
 }
 
@@ -509,16 +523,21 @@ def build_packet_from_spec(spec: Dict[str, Any]) -> Any:
     """
     packet = None
 
-    for layer in spec.get("layers", []):
+    layers = spec.get("layers", [])
+    for index, layer in enumerate(layers):
         layer_name = layer["name"]
         if layer_name not in LAYER_MAP:
             raise ValueError(f"Unsupported layer protocol: {layer_name}")
 
+        # 填充必须位于协议及业务负载之后，防止后续协议被排除在长度和校验和之外。
+        if layer_name == "Padding" and (packet is None or index != len(layers) - 1):
+            raise ValueError("Padding must be the final layer after protocol layers")
+
         fields = sanitize_fields(layer_name, layer.get("fields", {}))
         layer_cls = LAYER_MAP[layer_name]
 
-        # 对于 Raw 载荷特别处理，需要将 utf-8 字符串转换为字节
-        if layer_name == "Raw" and "load" in fields:
+        # 业务负载与尾部填充使用相同的转义字节格式，Padding 不参与协议长度计算。
+        if layer_name in ("Raw", "Padding") and "load" in fields:
             # 允许使用转义字符如 \x00
             try:
                 # 对字面量转义字符进行反序列化

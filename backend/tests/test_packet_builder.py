@@ -5,9 +5,10 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from scapy.layers.dns import DNS, DNSQR
 from scapy.layers.http import HTTPRequest
-from scapy.layers.inet import IP, TCP
+from scapy.layers.inet import IP, TCP, UDP
 from scapy.layers.l2 import ARP, Ether
-from scapy.utils import wrpcap
+from scapy.packet import Padding, Raw
+from scapy.utils import rdpcap, wrpcap
 from starlette.requests import Request
 
 from app.api.builders import build_pcap
@@ -17,6 +18,7 @@ from app.models.models import PacketSummary, PcapFile
 from app.schemas.schemas import BuilderSchemaResponse, LayerSpec, PcapBuildRequest
 from app.schemas.schemas import PacketPreviewRequest
 from app.services.packet_builder import build_packet_from_spec, get_builder_schema
+from app.services.packet_detail import packet_to_detail
 
 
 def _create_test_session(tmp_path):
@@ -46,6 +48,7 @@ def test_builder_schema_is_valid_and_includes_core_layers():
         "DNS",
         "DNSQR",
         "Raw",
+        "Padding",
     }.issubset(layer_names)
 
 
@@ -266,3 +269,80 @@ def test_build_pcap_records_parent_before_packet_summaries(tmp_path, monkeypatch
         )
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("padding", [b"\x00" * 18, b"\x00\xff\x80\x5c\x09\x0a\x0d"])
+def test_builder_preserves_arp_padding_from_packet_details_and_pcap(tmp_path, padding):
+    """详情中的填充原样进入构造器，导出 PCAP 保留零字节及非零字节。"""
+    original = (
+        bytes(
+            Ether(src="00:11:22:33:44:55", dst="ff:ff:ff:ff:ff:ff")
+            / ARP(hwsrc="00:11:22:33:44:55", psrc="192.0.2.1", pdst="192.0.2.2")
+        )
+        + padding
+    )
+    detail = packet_to_detail(0, original)
+    kept_fields = {
+        "Ethernet": {"src", "dst"},
+        "ARP": {"op", "hwsrc", "hwdst", "psrc", "pdst"},
+        "Padding": {"load"},
+    }
+    spec = {
+        "layers": [
+            {
+                "name": "Ether" if layer["name"] == "Ethernet" else layer["name"],
+                "fields": {
+                    field: value
+                    for field, value in layer["fields"].items()
+                    if field in kept_fields[layer["name"]]
+                },
+            }
+            for layer in detail["layers"]
+        ]
+    }
+    rebuilt = build_packet_from_spec(spec)
+    assert bytes(rebuilt) == original
+    assert bytes(rebuilt[Padding]) == padding
+    output = tmp_path / "padded.pcap"
+    wrpcap(str(output), [rebuilt])
+    assert bytes(rdpcap(str(output))[0]) == original
+
+
+@pytest.mark.parametrize("layer_name", ["TCP", "UDP"])
+def test_padding_is_excluded_from_network_length_and_transport_checksum(layer_name):
+    """业务负载保留在 IP 包内，尾部填充不计入长度或传输层校验和。"""
+    transport = TCP if layer_name == "TCP" else UDP
+    layers = [
+        {"name": "Ether", "fields": {}},
+        {"name": "IP", "fields": {"src": "192.0.2.1", "dst": "192.0.2.2"}},
+        {"name": layer_name, "fields": {"sport": "12345", "dport": "54321"}},
+        {"name": "Raw", "fields": {"load": r"abc\x00\xff"}},
+    ]
+    plain = build_packet_from_spec({"layers": layers})
+    padded = build_packet_from_spec(
+        {"layers": layers + [{"name": "Padding", "fields": {"load": r"\x00\xff\x00"}}]}
+    )
+    assert bytes(padded) == bytes(plain) + b"\x00\xff\x00"
+    assert padded[IP].len == plain[IP].len
+    assert padded[IP].chksum == plain[IP].chksum
+    assert padded[transport].chksum == plain[transport].chksum
+    assert padded[Raw].load == b"abc\x00\xff"
+    if layer_name == "UDP":
+        assert padded[UDP].len == plain[UDP].len
+
+
+@pytest.mark.parametrize(
+    "layers",
+    [
+        [{"name": "Padding", "fields": {"load": "pad"}}],
+        [
+            {"name": "Ether", "fields": {}},
+            {"name": "Padding", "fields": {"load": "pad"}},
+            {"name": "IP", "fields": {}},
+        ],
+    ],
+)
+def test_builder_rejects_padding_before_protocol_layers(layers):
+    """拒绝无协议或非尾部的填充，避免生成不符合预期的协议长度。"""
+    with pytest.raises(ValueError, match="Padding must be the final layer"):
+        build_packet_from_spec({"layers": layers})
